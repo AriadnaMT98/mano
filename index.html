@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control de mano - ESP32</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px;
+    font-family: system-ui, sans-serif;
+    background: #14171c; color: #e8eaed;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 10px; }
+  #vista {
+    width: 100%; max-height: 55vh; object-fit: contain;
+    background: #000; border-radius: 10px; display: block;
+  }
+  video { display: none; }            /* El video real no se ve; se dibuja en el canvas */
+  .fila { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  button {
+    flex: 1 1 45%; padding: 13px 8px; font-size: 0.95rem;
+    border: 0; border-radius: 8px; color: #fff; background: #2f6fed;
+  }
+  button.secundario { background: #3a4150; }
+  button:disabled { opacity: 0.5; }
+  .estado {
+    margin-top: 10px; padding: 9px 11px; border-radius: 8px;
+    background: #20252d; font-size: 0.9rem; line-height: 1.5;
+  }
+  .ok { color: #5fd38d; } .mal { color: #ff8a80; }
+  .dedo { display: flex; align-items: center; gap: 8px; margin-top: 7px; font-size: 0.9rem; }
+  .dedo span:first-child { width: 68px; }
+  .dedo span:last-child { width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+  .barra { flex: 1; height: 12px; background: #2a303a; border-radius: 6px; overflow: hidden; }
+  .barra div { height: 100%; width: 0%; background: #5fd38d; }
+</style>
+</head>
+<body>
+<h1>Control de mano - ESP32</h1>
+
+<video id="video" playsinline muted></video>
+<canvas id="vista"></canvas>
+
+<div class="fila">
+  <button id="btnConectar">Conectar ESP32</button>
+  <button id="btnCamara" class="secundario">Cambiar cámara</button>
+</div>
+<div class="fila">
+  <button id="btnAbierta" class="secundario">Calibrar mano ABIERTA</button>
+  <button id="btnCerrada" class="secundario">Calibrar mano CERRADA</button>
+</div>
+
+<div class="estado">
+  <div>Bluetooth: <b id="txtBle" class="mal">desconectado</b></div>
+  <div>Cámara: <b id="txtCam">iniciando...</b></div>
+  <div id="txtMsg"></div>
+</div>
+
+<div class="estado" id="dedos"></div>
+
+<script type="module">
+// =====================================================================
+// 1. CONFIGURACIÓN (lo que puedes ajustar)
+// =====================================================================
+
+// MediaPipe para navegador (lo mismo que usabas en Python, pero en JavaScript)
+import { HandLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const RUTA_WASM   = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const RUTA_MODELO = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// Identificadores BLE: tienen que ser IGUALES a los del código de Arduino
+const NOMBRE_ESP32  = "Mano_BLE";
+const UUID_SERVICIO = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const UUID_DATOS    = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+const NOMBRES = ["Pulgar", "Índice", "Medio", "Anular", "Meñique"];
+const PUNTAS  = [4, 8, 12, 16, 20];          // Landmarks de las puntas (igual que en Python)
+
+// Límites de ángulo [mínimo, máximo] por dedo. mínimo = abierto, máximo = cerrado.
+const LIMITES = [[50, 180], [50, 180], [50, 180], [50, 180], [50, 180]];
+
+// Calibración por defecto (se reemplaza al usar los botones de calibrar).
+// Son distancias medidas en "tamaños de palma", no en pixeles.
+let calAbierto = [1.20, 1.85, 2.00, 1.85, 1.60];
+let calCerrado = [0.60, 0.90, 0.85, 0.80, 0.80];
+
+const MS_ENTRE_ENVIOS = 50;   // Máximo 20 tramas por segundo
+const SUAVIZADO = 0.5;        // 0 = sin suavizar, cerca de 1 = muy suave pero lento
+
+// =====================================================================
+// 2. ELEMENTOS DE LA PÁGINA
+// =====================================================================
+const video  = document.getElementById("video");
+const canvas = document.getElementById("vista");
+const ctx    = canvas.getContext("2d");
+const txtBle = document.getElementById("txtBle");
+const txtCam = document.getElementById("txtCam");
+const txtMsg = document.getElementById("txtMsg");
+const btnConectar = document.getElementById("btnConectar");
+
+// Crear las 5 barritas que muestran el ángulo de cada dedo
+const cajaDedos = document.getElementById("dedos");
+const barras = [], numeros = [];
+NOMBRES.forEach(nombre => {
+  const fila = document.createElement("div");
+  fila.className = "dedo";
+  fila.innerHTML = `<span>${nombre}</span><div class="barra"><div></div></div><span>--</span>`;
+  cajaDedos.appendChild(fila);
+  barras.push(fila.querySelector(".barra div"));
+  numeros.push(fila.lastElementChild);
+});
+
+function mensaje(texto) { txtMsg.textContent = texto; }
+
+// Recuperar la calibración guardada en el celular (si existe)
+try {
+  const guardado = JSON.parse(localStorage.getItem("calibracionMano"));
+  if (guardado && guardado.abierto.length === 5 && guardado.cerrado.length === 5) {
+    calAbierto = guardado.abierto;
+    calCerrado = guardado.cerrado;
+  }
+} catch (e) { /* si no hay nada guardado, se usan los valores por defecto */ }
+
+// =====================================================================
+// 3. MATEMÁTICAS (lo mismo que hacía tu programa de Python)
+// =====================================================================
+
+// Igual que tu función mapear(): pasa un valor de un rango a otro y lo recorta
+function mapear(valor, inMin, inMax, outMin, outMax) {
+  if (inMax === inMin) return outMin;                       // Evitar dividir entre cero
+  const resultado = (valor - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+  const bajo = Math.min(outMin, outMax), alto = Math.max(outMin, outMax);
+  return Math.round(Math.max(bajo, Math.min(alto, resultado)));
+}
+
+// Mide qué tan estirado está cada dedo.
+// ancho y alto son el tamaño de la imagen, para medir en pixeles reales.
+function medirDedos(lm, ancho, alto) {
+  const dist = (a, b) => Math.hypot((a.x - b.x) * ancho, (a.y - b.y) * alto);
+
+  // Tamaño de la palma: de la muñeca (0) a la base del dedo medio (9).
+  // Dividir entre esto hace que NO importe si acercas o alejas la mano.
+  const palma = dist(lm[0], lm[9]) || 1;
+
+  return PUNTAS.map((punta, i) => {
+    // El pulgar casi no se aleja de la muñeca al abrirse, así que para él se mide
+    // contra la base del meñique (17). Los demás dedos se miden contra la muñeca (0).
+    const referencia = (i === 0) ? lm[17] : lm[0];
+    return dist(lm[punta], referencia) / palma;
+  });
+}
+
+let medidas = null;          // Últimas medidas suavizadas (null = no hay mano)
+
+// Recibe los 21 landmarks de una mano y devuelve los 5 ángulos
+function procesarMano(lm, ancho, alto) {
+  const nuevas = medirDedos(lm, ancho, alto);
+
+  // Suavizado: mezclar la medida nueva con la anterior para quitar temblores
+  medidas = medidas
+    ? medidas.map((vieja, i) => vieja * SUAVIZADO + nuevas[i] * (1 - SUAVIZADO))
+    : nuevas;
+
+  // Dedo abierto -> ángulo mínimo (50), dedo cerrado -> ángulo máximo (180)
+  return medidas.map((m, i) =>
+    mapear(m, calAbierto[i], calCerrado[i], LIMITES[i][0], LIMITES[i][1]));
+}
+
+// =====================================================================
+// 4. BLUETOOTH (BLE)
+// =====================================================================
+let caracteristica = null;   // El "canal" por donde se escriben los datos
+let enviando = false;        // true mientras un envío sigue en camino
+let ultimaTrama = "";
+let ultimoEnvio = 0;
+const codificador = new TextEncoder();   // Convierte texto a bytes
+
+function marcarBle(conectado) {
+  txtBle.textContent = conectado ? "conectado" : "desconectado";
+  txtBle.className = conectado ? "ok" : "mal";
+  btnConectar.textContent = conectado ? "Desconectar ESP32" : "Conectar ESP32";
+}
+
+let dispositivo = null;
+
+async function conectar() {
+  if (!navigator.bluetooth) {
+    mensaje("Este navegador no soporta Bluetooth. Usa Chrome en Android.");
+    return;
+  }
+  try {
+    mensaje("Buscando el ESP32...");
+    // Abre la ventanita de Chrome para elegir el dispositivo
+    dispositivo = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: NOMBRE_ESP32 }],
+      optionalServices: [UUID_SERVICIO]
+    });
+    dispositivo.addEventListener("gattserverdisconnected", () => {
+      caracteristica = null;
+      marcarBle(false);
+      mensaje("Se desconectó el ESP32.");
+    });
+
+    mensaje("Conectando...");
+    const servidor = await dispositivo.gatt.connect();
+    const servicio = await servidor.getPrimaryService(UUID_SERVICIO);
+    caracteristica = await servicio.getCharacteristic(UUID_DATOS);
+
+    ultimaTrama = "";
+    marcarBle(true);
+    mensaje("Listo. Muestra tu mano a la cámara.");
+  } catch (e) {
+    caracteristica = null;
+    marcarBle(false);
+    mensaje("No se pudo conectar: " + e.message);
+  }
+}
+
+btnConectar.onclick = () => {
+  if (dispositivo && dispositivo.gatt.connected) dispositivo.gatt.disconnect();
+  else conectar();
+};
+
+// Manda "pulgar,indice,medio,anular,menique" al ESP32
+async function enviar(angulos) {
+  if (!caracteristica || enviando) return;
+  const trama = angulos.join(",");
+  const ahora = performance.now();
+
+  // Solo mandar si cambió algo y ya pasó el tiempo mínimo entre envíos
+  if (trama === ultimaTrama || ahora - ultimoEnvio < MS_ENTRE_ENVIOS) return;
+
+  enviando = true;
+  try {
+    await caracteristica.writeValueWithoutResponse(codificador.encode(trama));
+    ultimaTrama = trama;
+    ultimoEnvio = ahora;
+  } catch (e) {
+    mensaje("Falló un envío: " + e.message);
+  } finally {
+    enviando = false;
+  }
+}
+
+// =====================================================================
+// 5. CALIBRACIÓN
+// =====================================================================
+function calibrar(tipo) {
+  if (!medidas) { mensaje("Primero muestra tu mano a la cámara."); return; }
+  if (tipo === "abierto") calAbierto = [...medidas];
+  else calCerrado = [...medidas];
+  try {
+    localStorage.setItem("calibracionMano",
+      JSON.stringify({ abierto: calAbierto, cerrado: calCerrado }));
+  } catch (e) { /* si no se puede guardar, igual funciona hasta cerrar la página */ }
+  mensaje(tipo === "abierto" ? "Mano abierta calibrada." : "Mano cerrada calibrada.");
+}
+document.getElementById("btnAbierta").onclick = () => calibrar("abierto");
+document.getElementById("btnCerrada").onclick = () => calibrar("cerrado");
+
+// =====================================================================
+// 6. CÁMARA
+// =====================================================================
+let camaraFrontal = true;
+
+async function iniciarCamara() {
+  // Apagar la cámara anterior si había una
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: camaraFrontal ? "user" : "environment",
+               width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    await video.play();
+    txtCam.textContent = camaraFrontal ? "frontal" : "trasera";
+  } catch (e) {
+    txtCam.textContent = "error";
+    mensaje("No se pudo abrir la cámara: " + e.message);
+  }
+}
+document.getElementById("btnCamara").onclick = () => {
+  camaraFrontal = !camaraFrontal;
+  iniciarCamara();
+};
+
+// =====================================================================
+// 7. CICLO PRINCIPAL (equivale a tu "while cap.isOpened()")
+// =====================================================================
+let detector = null;
+let dibujante = null;
+let ultimoTiempoVideo = -1;
+
+function ciclo() {
+  requestAnimationFrame(ciclo);      // Pedir que se repita en el siguiente cuadro
+  if (!detector || video.readyState < 2 || video.videoWidth === 0) return;
+  if (video.currentTime === ultimoTiempoVideo) return;   // Aún no hay cuadro nuevo
+  ultimoTiempoVideo = video.currentTime;
+
+  const ancho = video.videoWidth, alto = video.videoHeight;
+  if (canvas.width !== ancho) { canvas.width = ancho; canvas.height = alto; }
+
+  // Detectar la mano en el cuadro actual
+  const resultado = detector.detectForVideo(video, performance.now());
+
+  // Dibujar el video (en espejo si es la cámara frontal, como tu cv2.flip)
+  ctx.save();
+  if (camaraFrontal) { ctx.translate(ancho, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, ancho, alto);
+
+  if (resultado.landmarks && resultado.landmarks.length > 0) {
+    const lm = resultado.landmarks[0];
+    dibujante.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, { color: "#5fd38d", lineWidth: 3 });
+    dibujante.drawLandmarks(lm, { color: "#ffffff", radius: 3 });
+    ctx.restore();
+
+    const angulos = procesarMano(lm, ancho, alto);
+    angulos.forEach((a, i) => {
+      numeros[i].textContent = a + "°";
+      barras[i].style.width = mapear(a, LIMITES[i][0], LIMITES[i][1], 0, 100) + "%";
+    });
+    enviar(angulos);
+  } else {
+    ctx.restore();
+    medidas = null;                  // Sin mano: no se manda nada (igual que en Python)
+  }
+}
+
+async function iniciar() {
+  await iniciarCamara();
+  mensaje("Cargando el detector de manos...");
+  try {
+    const vision = await FilesetResolver.forVisionTasks(RUTA_WASM);
+    const opciones = delegate => ({
+      baseOptions: { modelAssetPath: RUTA_MODELO, delegate },
+      runningMode: "VIDEO",
+      numHands: 1,
+      minHandDetectionConfidence: 0.7
+    });
+    try {
+      detector = await HandLandmarker.createFromOptions(vision, opciones("GPU"));
+    } catch (e) {
+      // Si el celular no puede usar la tarjeta gráfica, usar el procesador
+      detector = await HandLandmarker.createFromOptions(vision, opciones("CPU"));
+    }
+    dibujante = new DrawingUtils(ctx);
+    mensaje("Detector listo. Presiona 'Conectar ESP32'.");
+  } catch (e) {
+    mensaje("No se pudo cargar el detector: " + e.message);
+  }
+  ciclo();
+}
+
+// Solo para pruebas desde la consola del navegador
+window.pruebaMano = { procesarMano, mapear, enviar };
+
+iniciar();
+</script>
+</body>
+</html>
