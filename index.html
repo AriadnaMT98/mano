@@ -75,19 +75,16 @@ const NOMBRE_ESP32  = "Mano_BLE";
 const UUID_SERVICIO = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const UUID_DATOS    = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 
-// Los 4 motores, en el MISMO orden que la trama que recibe el ESP32
-const NOMBRES = ["Pulgar giro", "Pulgar flex.", "Índice+Medio", "Anular+Meñique"];
+const NOMBRES = ["Pulgar", "Índice", "Medio", "Anular", "Meñique"];
+const PUNTAS  = [4, 8, 12, 16, 20];          // Landmarks de las puntas (igual que en Python)
 
-// Límites de ángulo [mínimo, máximo] por motor. mínimo = abierto, máximo = cerrado.
-const LIMITES = [[50, 180], [50, 180], [50, 180], [50, 180]];
+// Límites de ángulo [mínimo, máximo] por dedo. mínimo = abierto, máximo = cerrado.
+const LIMITES = [[50, 180], [50, 180], [50, 180], [50, 180], [50, 180]];
 
-// Se miden 6 cosas de la mano (el orden importa):
-//   0: giro del pulgar   1: flexión del pulgar
-//   2: índice   3: medio   4: anular   5: meñique
 // Calibración por defecto (se reemplaza al usar los botones de calibrar).
-let calAbierto = [1.30,  15, 1.85, 2.00, 1.85, 1.60];
-let calCerrado = [0.75, 100, 0.90, 0.85, 0.80, 0.80];
-const CLAVE_CAL = "calibracionMano4";   // Nombre con el que se guarda en el celular
+// Son distancias medidas en "tamaños de palma", no en pixeles.
+let calAbierto = [1.20, 1.85, 2.00, 1.85, 1.60];
+let calCerrado = [0.60, 0.90, 0.85, 0.80, 0.80];
 
 const MS_ENTRE_ENVIOS = 50;   // Máximo 20 tramas por segundo
 const SUAVIZADO = 0.5;        // 0 = sin suavizar, cerca de 1 = muy suave pero lento
@@ -110,7 +107,6 @@ NOMBRES.forEach(nombre => {
   const fila = document.createElement("div");
   fila.className = "dedo";
   fila.innerHTML = `<span>${nombre}</span><div class="barra"><div></div></div><span>--</span>`;
-  fila.firstElementChild.style.width = "112px";
   cajaDedos.appendChild(fila);
   barras.push(fila.querySelector(".barra div"));
   numeros.push(fila.lastElementChild);
@@ -120,8 +116,8 @@ function mensaje(texto) { txtMsg.textContent = texto; }
 
 // Recuperar la calibración guardada en el celular (si existe)
 try {
-  const guardado = JSON.parse(localStorage.getItem(CLAVE_CAL));
-  if (guardado && guardado.abierto.length === 6 && guardado.cerrado.length === 6) {
+  const guardado = JSON.parse(localStorage.getItem("calibracionMano"));
+  if (guardado && guardado.abierto.length === 5 && guardado.cerrado.length === 5) {
     calAbierto = guardado.abierto;
     calCerrado = guardado.cerrado;
   }
@@ -139,75 +135,37 @@ function mapear(valor, inMin, inMax, outMin, outMax) {
   return Math.round(Math.max(bajo, Math.min(alto, resultado)));
 }
 
-// Ángulo de doblez (en grados) en el punto b, formado por los segmentos a→b y b→c.
-// 0° = recto; entre más se dobla la articulación, más grande el número.
-// Usa x, y y también z (profundidad que estima MediaPipe).
-function doblez(a, b, c, ancho, alto) {
-  const v1 = [(b.x - a.x) * ancho, (b.y - a.y) * alto, (b.z - a.z) * ancho];
-  const v2 = [(c.x - b.x) * ancho, (c.y - b.y) * alto, (c.z - b.z) * ancho];
-  const punto = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
-  const largo = Math.hypot(...v1) * Math.hypot(...v2) || 1;
-  return Math.acos(Math.max(-1, Math.min(1, punto / largo))) * 180 / Math.PI;
-}
-
-// Mide 6 cosas de la mano. ancho y alto son el tamaño de la imagen.
-function medirMano(lm, ancho, alto) {
+// Mide qué tan estirado está cada dedo.
+// ancho y alto son el tamaño de la imagen, para medir en pixeles reales.
+function medirDedos(lm, ancho, alto) {
   const dist = (a, b) => Math.hypot((a.x - b.x) * ancho, (a.y - b.y) * alto);
 
   // Tamaño de la palma: de la muñeca (0) a la base del dedo medio (9).
   // Dividir entre esto hace que NO importe si acercas o alejas la mano.
   const palma = dist(lm[0], lm[9]) || 1;
-  // Ancho de la palma: base del índice (5) a base del meñique (17)
-  const anchoPalma = dist(lm[5], lm[17]) || 1;
 
-  // 0) GIRO DEL PULGAR (metacarpo): cuando el pulgar rota hacia la palma,
-  //    su nudillo (2) se acerca a la base del meñique (17).
-  const giroPulgar = dist(lm[2], lm[17]) / anchoPalma;
-
-  // 1) FLEXIÓN DEL PULGAR: suma de lo que se doblan sus dos articulaciones
-  //    (nudillo en 2 y articulación de la punta en 3). No depende del giro.
-  const flexPulgar = doblez(lm[1], lm[2], lm[3], ancho, alto)
-                   + doblez(lm[2], lm[3], lm[4], ancho, alto);
-
-  // 2-5) Los otros 4 dedos: distancia de la punta a la muñeca (como en Python)
-  const dedos = [8, 12, 16, 20].map(punta => dist(lm[punta], lm[0]) / palma);
-
-  return [giroPulgar, flexPulgar, ...dedos];
+  return PUNTAS.map((punta, i) => {
+    // El pulgar casi no se aleja de la muñeca al abrirse, así que para él se mide
+    // contra la base del meñique (17). Los demás dedos se miden contra la muñeca (0).
+    const referencia = (i === 0) ? lm[17] : lm[0];
+    return dist(lm[punta], referencia) / palma;
+  });
 }
 
 let medidas = null;          // Últimas medidas suavizadas (null = no hay mano)
 
-// Convierte una medida en "qué tan cerrado está": 0 = abierto, 1 = cerrado
-function cierre(valor, abierto, cerrado) {
-  if (abierto === cerrado) return 0;                 // Evitar dividir entre cero
-  const f = (valor - abierto) / (cerrado - abierto);
-  return Math.max(0, Math.min(1, f));
-}
-
-// Recibe los 21 landmarks de una mano y devuelve los 4 ángulos de los motores
+// Recibe los 21 landmarks de una mano y devuelve los 5 ángulos
 function procesarMano(lm, ancho, alto) {
-  const nuevas = medirMano(lm, ancho, alto);
+  const nuevas = medirDedos(lm, ancho, alto);
 
   // Suavizado: mezclar la medida nueva con la anterior para quitar temblores
   medidas = medidas
     ? medidas.map((vieja, i) => vieja * SUAVIZADO + nuevas[i] * (1 - SUAVIZADO))
     : nuevas;
 
-  // Qué tan cerrado está cada una de las 6 cosas medidas (0 a 1)
-  const c = medidas.map((m, i) => cierre(m, calAbierto[i], calCerrado[i]));
-
-  // Juntar en 4 motores. Math.max = "el que esté más cerrado manda",
-  // así si se mueve CUALQUIERA de los dos dedos, se mueve el motor.
-  const motores = [
-    c[0],                  // Pulgar giro
-    c[1],                  // Pulgar flexión
-    Math.max(c[2], c[3]),  // Índice + Medio
-    Math.max(c[4], c[5])   // Anular + Meñique
-  ];
-
-  // 0 (abierto) -> ángulo mínimo (50), 1 (cerrado) -> ángulo máximo (180)
-  return motores.map((f, i) =>
-    Math.round(LIMITES[i][0] + f * (LIMITES[i][1] - LIMITES[i][0])));
+  // Dedo abierto -> ángulo mínimo (50), dedo cerrado -> ángulo máximo (180)
+  return medidas.map((m, i) =>
+    mapear(m, calAbierto[i], calCerrado[i], LIMITES[i][0], LIMITES[i][1]));
 }
 
 // =====================================================================
@@ -265,7 +223,7 @@ btnConectar.onclick = () => {
   else conectar();
 };
 
-// Manda "pulgarGiro,pulgarFlex,indiceMedio,anularMenique" al ESP32
+// Manda "pulgar,indice,medio,anular,menique" al ESP32
 async function enviar(angulos) {
   if (!caracteristica || enviando) return;
   const trama = angulos.join(",");
@@ -294,7 +252,7 @@ function calibrar(tipo) {
   if (tipo === "abierto") calAbierto = [...medidas];
   else calCerrado = [...medidas];
   try {
-    localStorage.setItem(CLAVE_CAL,
+    localStorage.setItem("calibracionMano",
       JSON.stringify({ abierto: calAbierto, cerrado: calCerrado }));
   } catch (e) { /* si no se puede guardar, igual funciona hasta cerrar la página */ }
   mensaje(tipo === "abierto" ? "Mano abierta calibrada." : "Mano cerrada calibrada.");
